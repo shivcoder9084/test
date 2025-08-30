@@ -1,0 +1,125 @@
+final script  for node on the Linux server and its worked I have checked 
+#################
+
+#!/usr/bin/env bash
+bash -euxo pipefail <<'BASH'
+
+# --- Ensure we’re on the Jenkins-provided Node 22 ---
+if [ -n "$NODEJS_HOME" ]; then
+  export PATH="$NODEJS_HOME/bin:$PATH"
+fi
+echo "Using node: $(which node)"
+node -v
+npm -v
+
+# ============ CONFIG ============
+REPO_CLIENT_DIR="client"
+REPO_API_DIR="api"
+SERVER_HOST="ec2-13-234-245-168.ap-south-1.compute.amazonaws.com"
+SERVER_USER="ubuntu"
+DEPLOY_DIR="/var/www/dstechlogin"
+BACKUP_DIR="/var/www/backups"
+SSH_KEY="DSTech.pem"
+SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no"
+
+# =================== API DEPLOYMENT ===================
+echo "🏗️ Starting API packaging..."
+
+cd "$REPO_API_DIR"
+ZIPFILE_API="api_build_$(date +%Y%m%d_%H%M%S).zip"
+zip -r "../$ZIPFILE_API" .
+cd ..
+
+echo "📤 Uploading $ZIPFILE_API to ${SERVER_USER}@${SERVER_HOST}:/tmp/$ZIPFILE_API ..."
+scp $SSH_OPTS "$ZIPFILE_API" "${SERVER_USER}@${SERVER_HOST}:/tmp/$ZIPFILE_API"
+
+ssh $SSH_OPTS "${SERVER_USER}@${SERVER_HOST}" bash -s -- "$ZIPFILE_API" "$DEPLOY_DIR" "$BACKUP_DIR/dstechapi" <<'REMOTE_API'
+set -euo pipefail
+
+ZIPFILE="$1"
+DEPLOY_DIR="$2"
+BACKUP_DIR="$3"
+TMP_DIR="/tmp/deploy_api_$RANDOM"
+
+sudo mkdir -p "$DEPLOY_DIR" "$TMP_DIR" "$BACKUP_DIR"
+
+# Backup current deployment
+if [ -d "$DEPLOY_DIR" ] && [ -n "$(ls -A "$DEPLOY_DIR" 2>/dev/null || true)" ]; then
+  TS=$(date +"%Y%m%d_%H%M%S")
+  sudo zip -r "$BACKUP_DIR/backup_$TS.zip" "$DEPLOY_DIR"/*
+fi
+
+# Extract API zip into temp folder
+sudo unzip -q "/tmp/$ZIPFILE" -d "$TMP_DIR"
+
+# Copy all API files to deployment root, overwrite but don’t delete anything else
+sudo rsync -a "$TMP_DIR/" "$DEPLOY_DIR/"
+
+# Cleanup
+sudo rm -rf "$TMP_DIR" "/tmp/$ZIPFILE"
+
+
+echo "✅ API deployment done!"
+REMOTE_API
+
+# =================== CLIENT DEPLOYMENT ===================
+echo "🏗️ Starting client build process..."
+
+cd "$REPO_CLIENT_DIR"
+npm run build
+
+if [ -d "dist" ]; then
+   ZIPFILE_CLIENT="client_build_$(date +%Y%m%d_%H%M%S).zip"
+   zip -r "../$ZIPFILE_CLIENT" dist
+   cd ..
+else
+  echo "❌ Client build output folder not found!"
+  exit 1
+fi
+
+echo "📤 Uploading $ZIPFILE_CLIENT to ${SERVER_USER}@${SERVER_HOST}:/tmp/$ZIPFILE_CLIENT ..."
+scp $SSH_OPTS "$ZIPFILE_CLIENT" "${SERVER_USER}@${SERVER_HOST}:/tmp/$ZIPFILE_CLIENT"
+
+ssh $SSH_OPTS "${SERVER_USER}@${SERVER_HOST}" bash -s -- "$ZIPFILE_CLIENT" "$DEPLOY_DIR" "$BACKUP_DIR/dstechlogin" <<'REMOTE_CLIENT'
+set -euo pipefail
+
+ZIPFILE="$1"
+DEPLOY_DIR="$2"
+BACKUP_DIR="$3"
+TMP_DIR="/tmp/deploy_client_$RANDOM"
+
+sudo mkdir -p "$DEPLOY_DIR" "$TMP_DIR" "$BACKUP_DIR"
+
+# Backup current dist folder only
+if [ -d "$DEPLOY_DIR/dist" ] && [ -n "$(ls -A "$DEPLOY_DIR/dist" 2>/dev/null || true)" ]; then
+  TS=$(date +"%Y%m%d_%H%M%S")
+  sudo zip -r "$BACKUP_DIR/backup_dist_$TS.zip" "$DEPLOY_DIR/dist"/*
+fi
+
+sudo unzip -q "/tmp/$ZIPFILE" -d "$TMP_DIR"
+sudo mkdir -p "$DEPLOY_DIR/dist"
+sudo rsync -a --delete "$TMP_DIR/dist/" "$DEPLOY_DIR/dist/"
+sudo rm -rf "$TMP_DIR" "/tmp/$ZIPFILE"
+
+echo "✅ Client deployment done!"
+REMOTE_CLIENT
+
+# =================== POST-DEPLOY COMMANDS ===================
+echo "🚀 Running post-deployment commands (npm install & PM2 restart)..."
+
+ssh $SSH_OPTS "${SERVER_USER}@${SERVER_HOST}" bash -s -- "$DEPLOY_DIR" <<'POST_DEPLOY'
+set -euo pipefail
+
+DEPLOY_DIR="$1"
+cd "$DEPLOY_DIR"
+
+echo "📦 Installing npm packages..."
+sudo npm install --unsafe-perm
+
+echo "🔄 Restarting PM2 process (id: 3)..."
+sudo pm2 restart 3
+
+echo "✅ Post-deployment commands completed!"
+POST_DEPLOY
+
+BASH
